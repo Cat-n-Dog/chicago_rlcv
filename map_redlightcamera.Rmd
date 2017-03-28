@@ -1,0 +1,235 @@
+---
+title: "Exploring Chicago Red Light Camera Violations"
+output: 
+  html_notebook: 
+    theme: readable
+author: XYZ
+---
+
+A couple of days ago, I read about [this news](http://www.chicagotribune.com/news/watchdog/redlight/ct-red-light-study-0321-20170321-story.html) that said Cicago motorists will get a longer grace period before getting hit with a \$100 red light camera ticket. Chicago extend the "enforcement threshold" when cars are given tickets from 0.1 seconds to 0.3 seconds after the light turns red. It's believed the change will cut the number of tickets issued by about 29 percent and result in an expected revenue loss of \$17 million this year.
+
+This is great news, I guess, to many drivers in the city. To people who are interested in data science this is also a great opportunity to explore the impact of a policy change, by studying the public available data. Luckily, city of Chicago publishes *Red Light Camera Violations* dataset at the [City of Chicago Data Portal](https://data.cityofchicago.org/Transportation/Red-Light-Camera-Violations/spqx-js37/data)
+
+In this first part of the series, we will explore the dataset and try to answer the following questions,
+
+1. Where are the cameras?
+2. Which intersections have the most or the fewest violations?
+3. Can we build a model to predict the number of violations?
+
+In the next post, we will use an updated dataset after the new policy kicks in for a few weeks along with our model to examine if the new policy brings down ticket issuance.
+
+The whole analysis will be done in R notebook. We start by loading all necessary packages.
+
+```{r Load Packages, message=FALSE, warning=FALSE}
+library(plyr)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(ggmap)
+library(ggthemes)
+library(viridis)
+library(lubridate)
+library(forecast)
+library(xts)
+library(prophet)
+```
+
+The dataset was downloaded as of March 22. We read in the data saved as a CSV file and show the last six rows of the file. The rows are sorted by violaion date. We can see that the latest violation records are from 03/08/2017. Remember that the new rule does not take effect until March 20. So the data in the file records those violations 0.1 second from the light turns red. Another quick look at the summary reveals that there're NAs in the camera ID column, coordinates columns and locations columns. The City of Chicago publishes the [list of current Red Light Camera intersections](https://www.cityofchicago.org/content/dam/city/depts/cdot/Red%20Light%20Cameras/Active_RLC_Intersections.pdf). By looking at the list we know that at each section, usually there are multiple cameras, facing different directions. We take a simplified approach here and aggregate the violations of such cameras at the same intersections. We care about the violations at the intersection level and won't distinguish if east-west traffic or north-south traffic is more violation-prone.
+
+```{r Read the Dataset}
+rlcv <- read.csv("Red_Light_Camera_Violations.csv") %>% tbl_df()
+```
+
+```{r Summary Statistics}
+rlcv %>% tail() %>% print()
+rlcv %>% summary()
+```
+
+As we see below, the missing camera IDs composite a small portion of records in the dataset. And when aggregating the violations at the intersection level, the missing IDs shouldn't affect our analysis.
+
+```{r Missing ID}
+rlcv %>% group_by(INTERSECTION, CAMERA.ID) %>% 
+  #select(INTERSECTION, CAMERA.ID, VIOLATION.DATE, VIOLATIONS) %>% 
+  dplyr::summarize(Sum.Of.Violations = sum(VIOLATIONS))
+```
+
+We want to map the red lights onto a Chicago map. Missing location data could be a challenge to us. Let's see how we can fix that. We notice that every record with missing locations has a valid intersection value. Since we analyze at the intersection level, as long as we have the location for that intersection, we will use that to fill in the blanks. We still have three intersections without location data. We will ignore them in visualization for the moment.
+
+```{r}
+intersection_geo <- rlcv %>% group_by(INTERSECTION) %>% 
+  dplyr::summarize(intersection_lat = round(mean(LATITUDE, na.rm = T), 3),
+                   intersection_lon = round(mean(LONGITUDE, na.rm = T), 3))
+intersection_geo
+```
+
+Let's first see where these cameras are. The network of the red light cameras is pretty much covering the core neighborhoods of Chicago. But there aren't many cameras in the Loop or South Loop area. 
+
+```{r, fig.height=8, fig.width=8, message=FALSE, warning=FALSE}
+qmplot(intersection_lon, intersection_lat, data = intersection_geo,
+       zoom = 11, size = I(1.25), color = I("red"),
+       maptype = "toner-lite",
+       main = "Intersections with Red Light Cameras") +
+  theme_minimal() + xlab("") + ylab("")
+```
+
+It would be interesting to see which intersections have seen the most violations since the installation of the cameras. LAKE SHORE DR AND BELMONT has seen the most violations. CICERO AND I55 and VAN BUREN AND WESTERN are not far away.
+
+```{r, }
+rlcv %>% group_by(INTERSECTION) %>% 
+  dplyr::summarize(sum_violations = sum(VIOLATIONS),
+            med_violations = median(VIOLATIONS),
+            lat2 = round(mean(LATITUDE, na.rm = T), 4),
+            lon2 = round(mean(LONGITUDE, na.rm = T), 4)) %>% 
+  arrange(-sum_violations) -> intersection_violations
+
+intersection_violations
+```
+
+```{r Sum of Violation by Intersection, fig.height=8, fig.width=8, message=FALSE, warning=FALSE}
+qmplot(lon2, lat2, data = intersection_violations,
+       zoom = 11, size = sum_violations,
+       maptype = "toner-lite", color = sum_violations,
+       main = "Sum of violations at each intersection") +
+  viridis::scale_color_viridis(option = "magma", direction = -1) +
+  theme_minimal() + xlab("") + ylab("") +
+  guides(color=guide_legend(title = ""),
+         size = guide_legend(title = ""))
+```
+
+But by looking at the total of the violations since the start of the data may not be an accurate description. It's possible that some red light cameras are newly installed and hasn't had accumulated many violations. However these new cameras could send out many tickets on a daily basis. To accomodate that thought, we look at the median of the violations at the intersections, which would give us a view of what a typical day looks like. And we take a snap shot of February 2017 data. This should give us a most recent view of which cameras have seen the most violations in a month.
+
+```{r Median Violation per intersection, fig.height=8, fig.width=8, message=FALSE, warning=FALSE}
+qmplot(lon2, lat2, data = intersection_violations,
+       zoom = 11, size = med_violations,
+       maptype = "toner-lite", color = med_violations,
+       main = "Median of violations at each intersection") +
+  viridis::scale_color_viridis(option = "magma", direction = -1) +
+  theme_minimal() + xlab("") + ylab("") +
+  guides(color=guide_legend(title = ""),
+         size = guide_legend(title = ""))
+```
+
+```{r February Violation per intersection, fig.height=8, fig.width=8, message=TRUE, warning=TRUE}
+rlcv %>%
+  dplyr::mutate(VIOLATION.DATE = mdy(VIOLATION.DATE)) %>% 
+  filter(VIOLATION.DATE >= "2017-02-01" &
+           VIOLATION.DATE < "2017-03-01") -> feb.violation
+```
+
+```{r, fig.height=8, fig.width=8, message=FALSE, warning=FALSE}
+feb.violation %>% group_by(INTERSECTION) %>% 
+  dplyr::summarize(sum_violations = sum(VIOLATIONS),
+            n = n(),
+            lat2 = round(mean(LATITUDE, na.rm = T), 4),
+            lon2 = round(mean(LONGITUDE, na.rm = T), 4)) -> feb.vio.sum
+
+qmplot(lon2, lat2, data = feb.vio.sum,
+       zoom = 11, size = sum_violations,
+       maptype = "toner-lite", color = sum_violations,
+       main = "Sum of violations at each intersection in February 2017") +
+  viridis::scale_color_viridis(option = "magma", direction = -1) +
+  theme_minimal() + xlab("") + ylab("") +
+  guides(color=guide_legend(title = ""),
+         size = guide_legend(title = ""))
+```
+
+The charts provides different angles to the number of violations. But it's very obvious from all three charts that the intersection of CICERO AND I55 is probably the most notorious red camera intersection in the Chicagoland.
+
+Let's try to build a model to see if we can predict daily violations at the intersection of our interest.
+
+```{r}
+rlcv %>% filter(INTERSECTION == "CICERO AND I55") %>% 
+  dplyr::mutate(VIOLATION.DATE = mdy(VIOLATION.DATE)) %>% 
+  group_by(VIOLATION.DATE) %>% 
+  dplyr::summarize(sum.violations = sum(VIOLATIONS)) %>% 
+  arrange(VIOLATION.DATE) -> cicero.55
+
+rlcv %>% filter(INTERSECTION == "LAKE SHORE DR AND BELMONT") %>% 
+  dplyr::mutate(VIOLATION.DATE = mdy(VIOLATION.DATE)) %>% 
+  group_by(VIOLATION.DATE) %>% 
+  dplyr::summarize(sum.violations = sum(VIOLATIONS)) %>% 
+  arrange(VIOLATION.DATE) -> lakeshore.belmont
+```
+
+```{r}
+cicero.55.xts <- xts(cicero.55[,-1], order.by=cicero.55$VIOLATION.DATE)
+xts::plot.xts(cicero.55.xts)
+
+lakeshore.belmont.xts <- xts(lakeshore.belmont[,-1],
+                             order.by=lakeshore.belmont$VIOLATION.DATE)
+xts::plot.xts(lakeshore.belmont.xts)
+```
+
+Now we realize the intersection CICERO AND I55 misses data from April to October in 2015. We decide to use data from Nov 2015 to end of 2016 to build a model and test it on 2017 data. There are many time series modeling approach out there. This time we will try a new method, namely prophet, published by Facebook recently.
+
+```{r Cicero 55 model, message=FALSE, warning=FALSE}
+cicero.55 %>%
+  filter(VIOLATION.DATE > "2015/11/1",
+         VIOLATION.DATE < "2017/1/1") %>%
+  dplyr::rename(y = sum.violations, ds = VIOLATION.DATE) -> cicero.55.data
+
+cicero.55 %>%
+  filter(VIOLATION.DATE >= "2017/1/1") %>%
+  dplyr::rename(y = sum.violations, ds = VIOLATION.DATE) -> cicero.55.test
+
+fit.prophet <- prophet(cicero.55.data)
+#summary(fit.prophet)
+
+future <- make_future_dataframe(fit.prophet, periods = 68)
+fcst <- predict(fit.prophet, future)
+plot(fit.prophet, fcst) +
+  geom_line(data = cicero.55.data, aes(x = ds, y = y), alpha = 0.25) +
+  geom_point(data = cicero.55.test, aes(x = ds, y = y), color = "orange") +
+  xlab("Date")
+prophet_plot_components(fit.prophet, fcst)
+
+fcst %>% tbl_df() %>% 
+  filter(ds >= "2017/1/1") %>% 
+  select(ds, yhat) -> fcst.test
+
+inner_join(cicero.55.test, fcst.test, by = "ds") -> cicero.55.test.acc
+ggplot(cicero.55.test.acc, aes(x = ds)) +
+  geom_point(aes(y = y)) +
+  geom_line(aes(y = yhat), color = "blue") +
+  xlab("Date") + ylab("Out of sample actuals and predicted")
+
+(cicero.55.test.acc$y - cicero.55.test.acc$yhat) %>%
+  abs() %>% mean()
+```
+
+We can see that the model recognizes a general trend but fails to capture the volatility of the violations from day to day. The mean absolute error in 2017 is about 21. We try the model on another intersection with a longer violation history.
+
+```{r}
+lakeshore.belmont %>%
+  filter(VIOLATION.DATE < "2017/1/1") %>%
+  dplyr::rename(y = sum.violations, ds = VIOLATION.DATE) -> lakeshore.belmont.data
+
+lakeshore.belmont %>%
+  filter(VIOLATION.DATE >= "2017/1/1") %>%
+  dplyr::rename(y = sum.violations, ds = VIOLATION.DATE) -> lakeshore.belmont.test
+
+fit.prophet <- prophet(lakeshore.belmont.data)
+
+future <- make_future_dataframe(fit.prophet, periods = 68)
+fcst <- predict(fit.prophet, future)
+plot(fit.prophet, fcst) +
+  geom_line(data = lakeshore.belmont.data, aes(x = ds, y = y), alpha = 0.25) +
+  geom_point(data = lakeshore.belmont.test, aes(x = ds, y = y), color = "orange") +
+  xlab("Date") + ylab("Violations")
+prophet_plot_components(fit.prophet, fcst)
+
+fcst %>% tbl_df() %>% 
+  filter(ds >= "2017/1/1") %>% 
+  select(ds, yhat) -> fcst.test
+
+inner_join(lakeshore.belmont.test, fcst.test, by = "ds") -> lakeshore.belmont.test.acc
+ggplot(lakeshore.belmont.test.acc, aes(x = ds)) +
+  geom_point(aes(y = y)) +
+  geom_line(aes(y = yhat), color = "blue") +
+  xlab("Date") + ylab("Out of sample actuals and predicted")
+
+```
+
+This time the model seems to be able to fit well in sample. But it shows a upward bias in the 2017 out of sample predictions. There's no doubt it's no easy task to accurately predict the violations into the future. We will explore this topic in the next post.
+
+In summary, what we have achieved in this post is to gather the data from City of Chicago data portal and draw the violations on a map. We also entertained the idea of building a predictive model to forecast violations into the future. Hope you find some of the content interesting or useful. Let us know if you have any thoughts.
